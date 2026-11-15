@@ -15,12 +15,16 @@ Parameters:
     Description: Ubuntu 24.04 LTS (se resuelve sola, no tocar)
   ScriptsUrl:
     Type: String
-    Default: https://raw.githubusercontent.com/anafelix21/tareas-ocares-/main/data-script
+    Default: https://raw.githubusercontent.com/PierreAlexisConca/Kafka-Ocares/main/data-script
     Description: Carpeta raw de GitHub con los scripts de cada EC2 (no tocar)
   DockerUser:
     Type: String
     Default: concaflores
     Description: Usuario de Docker Hub con las imagenes avsa-*:2.0
+  SqlPassword:
+    Type: String
+    NoEcho: true
+    Description: Clave del usuario sa de SQL Server
   MongoUri:
     Type: String
     NoEcho: true
@@ -100,7 +104,7 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           curl -fsSL --retry 30 --retry-delay 5 --retry-all-errors ${ScriptsUrl}/k8s-master.sh -o /root/lab.sh
-          DOCKER_USER=${DockerUser} MONGO_URI='${MongoUri}' bash /root/lab.sh
+          DOCKER_USER=${DockerUser} MONGO_URI='${MongoUri}' SQL_PASSWORD='${SqlPassword}' bash /root/lab.sh
 
   K8sNodeFrontend:
     Type: AWS::EC2::Instance

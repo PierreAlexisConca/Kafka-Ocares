@@ -1,11 +1,12 @@
 #!/bin/bash
 # k8s-master: K3s control plane + kube-state-metrics + app (3 nodos dedicados) + scripts de fallas
 # Lo descarga y ejecuta el user data de la plantilla lab-kafka-k8s.yaml
-# Variables que recibe: DOCKER_USER (opcional), MONGO_URI (obligatoria, MongoDB Atlas)
+# Variables que recibe: DOCKER_USER (opcional), IMAGE_TAG (opcional), MONGO_URI y SQL_PASSWORD (obligatorias)
 exec > >(tee -a /var/log/lab.log) 2>&1
 log() { echo "[$(date +%H:%M:%S)] [LAB] $*"; }
 DOCKER_USER=${DOCKER_USER:-concaflores}
-: "${MONGO_URI:?falta MONGO_URI (URI de MongoDB Atlas)}"
+IMAGE_TAG=${IMAGE_TAG:-latest}   # <- cambiar aqui si tus imagenes no usan el tag latest
+: "${MONGO_URI:?falta MONGO_URI (URI de MongoDB Atlas)}" "${SQL_PASSWORD:?falta SQL_PASSWORD (clave de SQL Server)}"
 NS=avsa-namespace
 L=/home/ubuntu/lab
 log "Instalando K3s (control plane)"
@@ -20,7 +21,8 @@ cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
 KUBECONFIG=/home/ubuntu/.kube/config kubectl config set-context --current --namespace=$NS
 echo 'export KUBECONFIG=$HOME/.kube/config' > /etc/profile.d/lab-kube.sh
 
-# ---------- Namespace, configuracion, metricas del Backend 2 y Services
+# >>> APP-BEGIN
+# ---------- Namespace, configuracion, metricas del Backend 2 (FastAPI) y Services
 cat > $L/app.yaml <<'EOF'
 apiVersion: v1
 kind: Namespace
@@ -32,30 +34,30 @@ metadata: {name: app-config, namespace: avsa-namespace}
 data:
   SPRING_PROFILES_ACTIVE: "cloud"
   SERVER_PORT: "8081"
+  SPRING_R2DBC_URL: "r2dbc:pool:sqlserver://sqlserver-externo:1433/avsa_db?trustServerCertificate=true"
+  SPRING_R2DBC_USERNAME: "sa"
   SQL_HOST: "sqlserver-externo"
   SQL_SERVER: "sqlserver-externo"
-  MONGO_URI: "__MONGO_URI__"
   MONGO_DATABASE: "avsa_db"
   ANALYTICS_URL: "http://backend-analitico:5000"
   ANALYTICS_EVENTS_ENABLED: "false"
   SECURITY_ENFORCE: "false"
-  FLASK_ENV: "production"
-  FLASK_DEBUG: "False"
+  PORT: "8000"
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata: {name: backend2-metrics, namespace: avsa-namespace}
 data:
-  metrics_wsgi.py: |
-    # Envuelve la app Flask del Backend 2 y publica /metrics con http_requests_total
+  metrics_asgi.py: |
+    # Envuelve la app FastAPI del Backend 2 (app.main:app) y publica /metrics con http_requests_total
     import threading
-    from wsgi import app as flask_app
+    from app.main import app as fastapi_app
 
     _lock = threading.Lock()
     _contador = {}
 
     def _metricas():
-        lineas = ["# HELP http_requests_total Peticiones HTTP atendidas por el Backend 2 Flask",
+        lineas = ["# HELP http_requests_total Peticiones HTTP atendidas por el Backend 2 FastAPI",
                   "# TYPE http_requests_total counter"]
         with _lock:
             for (metodo, ruta, estado), valor in sorted(_contador.items()):
@@ -63,21 +65,27 @@ data:
                               % (metodo, ruta, estado, valor))
         return ("\n".join(lineas) + "\n").encode()
 
-    def application(environ, start_response):
-        ruta = environ.get("PATH_INFO", "/")
+    async def application(scope, receive, send):
+        if scope["type"] != "http":
+            await fastapi_app(scope, receive, send)
+            return
+        ruta = scope.get("path", "/")
         if ruta == "/metrics":
             cuerpo = _metricas()
-            start_response("200 OK", [("Content-Type", "text/plain; version=0.0.4"),
-                                      ("Content-Length", str(len(cuerpo)))])
-            return [cuerpo]
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"text/plain; version=0.0.4"),
+                                    (b"content-length", str(len(cuerpo)).encode())]})
+            await send({"type": "http.response.body", "body": cuerpo})
+            return
         estado = {"codigo": "500"}
-        def _sr(status, headers, exc_info=None):
-            estado["codigo"] = status.split(" ", 1)[0]
-            return start_response(status, headers, exc_info)
+        async def _send(mensaje):
+            if mensaje["type"] == "http.response.start":
+                estado["codigo"] = str(mensaje["status"])
+            await send(mensaje)
         try:
-            return flask_app(environ, _sr)
+            await fastapi_app(scope, receive, _send)
         finally:
-            clave = (environ.get("REQUEST_METHOD", "GET"), ruta[:80].replace('"', ""), estado["codigo"])
+            clave = (scope.get("method", "GET"), ruta[:80].replace('"', ""), estado["codigo"])
             with _lock:
                 _contador[clave] = _contador.get(clave, 0) + 1
 ---
@@ -103,7 +111,7 @@ metadata: {name: backend-analitico, namespace: avsa-namespace}
 spec:
   type: NodePort
   selector: {app: backend2}
-  ports: [{port: 5000, targetPort: 5000, nodePort: 30002}]
+  ports: [{port: 5000, targetPort: 8000, nodePort: 30002}]
 ---
 apiVersion: v1
 kind: Service
@@ -129,7 +137,7 @@ spec:
       enableServiceLinks: false
       containers:
       - name: frontend
-        image: ${DOCKER_USER}/avsa-frontend:2.0
+        image: ${DOCKER_USER}/avsa-frontend:${IMAGE_TAG}
         ports: [{containerPort: 80}]
         resources: {requests: {cpu: 250m, memory: 128Mi}, limits: {memory: 256Mi}}
         readinessProbe: {httpGet: {path: /, port: 80}, initialDelaySeconds: 5, periodSeconds: 10}
@@ -148,9 +156,9 @@ spec:
       enableServiceLinks: false
       containers:
       - name: backend1
-        image: ${DOCKER_USER}/avsa-backend:2.0
+        image: ${DOCKER_USER}/springboot-webflux-mongodb:${IMAGE_TAG}
         ports: [{containerPort: 8081}]
-        envFrom: [{configMapRef: {name: app-config}}]
+        envFrom: [{configMapRef: {name: app-config}}, {secretRef: {name: app-secrets}}]
         resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 1536Mi}}
         readinessProbe: {tcpSocket: {port: 8081}, initialDelaySeconds: 20, periodSeconds: 10}
 ---
@@ -167,26 +175,27 @@ spec:
       enableServiceLinks: false
       containers:
       - name: backend2
-        image: ${DOCKER_USER}/avsa-backend-analitico:2.0
-        command: ["gunicorn"]
-        args: ["-w", "1", "--threads", "8", "-b", "0.0.0.0:5000", "--timeout", "60",
-               "--access-logfile", "-", "--pythonpath", "/opt/metrics", "metrics_wsgi:application"]
-        ports: [{containerPort: 5000}]
-        envFrom: [{configMapRef: {name: app-config}}]
+        image: ${DOCKER_USER}/avsa-analytics:${IMAGE_TAG}
+        command: ["python", "-m", "uvicorn"]
+        args: ["metrics_asgi:application", "--host", "0.0.0.0", "--port", "8000"]
+        env: [{name: PYTHONPATH, value: "/app:/opt/metrics"}]
+        ports: [{containerPort: 8000}]
+        envFrom: [{configMapRef: {name: app-config}}, {secretRef: {name: app-secrets}}]
         volumeMounts: [{name: metrics, mountPath: /opt/metrics}]
         resources: {requests: {cpu: 200m, memory: 256Mi}, limits: {memory: 1Gi}}
-        readinessProbe: {tcpSocket: {port: 5000}, initialDelaySeconds: 15, periodSeconds: 10}
+        readinessProbe: {tcpSocket: {port: 8000}, initialDelaySeconds: 15, periodSeconds: 10}
       volumes: [{name: metrics, configMap: {name: backend2-metrics}}]
 EOF
 
-# Inserta la URI de Mongo (llega por variable de entorno, no esta escrita en este script)
-python3 -I - "$L/app.yaml" <<'PY'
-import os, sys
-p = sys.argv[1]
-s = open(p).read().replace("__MONGO_URI__", os.environ["MONGO_URI"])
-open(p, "w").write(s)
-PY
 kubectl apply -f $L/app.yaml
+# Claves (Mongo Atlas y SQL Server): llegan por variable de entorno, no estan escritas en ningun script del repo
+kubectl -n $NS create secret generic app-secrets \
+  --from-literal=SPRING_DATA_MONGODB_URI="$MONGO_URI" \
+  --from-literal=MONGO_URI="$MONGO_URI" \
+  --from-literal=SPRING_R2DBC_PASSWORD="$SQL_PASSWORD" \
+  --from-literal=SQL_PASSWORD="$SQL_PASSWORD" \
+  --dry-run=client -o yaml | kubectl apply -f -
+# >>> APP-END
 log "Instalando kube-state-metrics v2.13.0"
 KSM=https://raw.githubusercontent.com/kubernetes/kube-state-metrics/v2.13.0/examples/standard
 for f in service-account cluster-role cluster-role-binding deployment service; do
